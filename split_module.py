@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import random
 import re
-from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Any
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Any, Iterable
 
 
 # Exception definitions -----------------------------------------------------
@@ -83,6 +83,173 @@ def _to_numeric(val: Any) -> Any:
         except ValueError:
             return val
     return val
+
+
+def split_dataset(
+    dataset: List[Dict[str, Any]],
+    train_fraction: float,
+    validation_fraction: float = 0.0,
+    test_fraction: float | None = None,
+    shuffle: bool = True,
+    random_seed: int | None = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Split dataset into up to three subsets.
+
+    This utility implements feature #B7D12-F0001 from the specification.
+    """
+
+    if not dataset or len(dataset) < 2:
+        raise DatasetTooSmallException(
+            "Input dataset must contain at least two rows for splitting.")
+
+    if test_fraction is None:
+        test_fraction = 1.0 - train_fraction - validation_fraction
+
+    total_frac = train_fraction + validation_fraction + test_fraction
+    if abs(total_frac - 1.0) > 1e-6:
+        raise FractionOutOfRangeException(
+            "train + validation + test fractions must sum to 1.0")
+    for val in (train_fraction, validation_fraction, test_fraction):
+        if not 0 <= val <= 1:
+            raise FractionOutOfRangeException(
+                "Fraction values must be between 0 and 1")
+
+    data = list(dataset)
+    if shuffle:
+        rnd = random.Random(random_seed)
+        rnd.shuffle(data)
+
+    n = len(data)
+    train_count = int(n * train_fraction)
+    val_count = int(n * validation_fraction)
+    test_count = n - train_count - val_count
+
+    for frac, count in (
+        (train_fraction, train_count),
+        (validation_fraction, val_count),
+        (test_fraction, test_count),
+    ):
+        if frac > 0 and count == 0:
+            raise DatasetTooSmallException(
+                "Dataset too small for requested split fractions")
+
+    train_set = data[:train_count]
+    val_set = data[train_count:train_count + val_count]
+    test_set = data[train_count + val_count:]
+
+    result = {"train": train_set, "test": test_set}
+    if validation_fraction > 0:
+        result["validation"] = val_set
+    return result
+
+
+def k_fold_split(
+    dataset: List[Dict[str, Any]],
+    k: int,
+    shuffle: bool = True,
+    random_seed: int | None = None,
+) -> List[Dict[str, List[Dict[str, Any]]]]:
+    """Create K-fold cross validation splits (feature #B7D12-F0003)."""
+    if k < 2 or k > len(dataset):
+        raise FractionOutOfRangeException(
+            "K must be at least 2 and less than or equal to dataset size")
+
+    data = list(dataset)
+    if shuffle:
+        rnd = random.Random(random_seed)
+        rnd.shuffle(data)
+
+    n = len(data)
+    fold_size = n // k
+    remainder = n % k
+    folds = []
+    start = 0
+    for i in range(k):
+        end = start + fold_size + (1 if i < remainder else 0)
+        val = data[start:end]
+        train = data[:start] + data[end:]
+        folds.append({"train": train, "validation": val})
+        start = end
+    return folds
+
+
+def sequential_split(
+    dataset: List[Dict[str, Any]],
+    train_fraction: float,
+    validation_fraction: float = 0.0,
+    test_fraction: float | None = None,
+    time_column: str | None = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Split dataset in temporal order without shuffling (feature #B7D12-F0004)."""
+
+    if time_column and time_column not in dataset[0]:
+        raise MissingParameterException(
+            "Specified time_column not found in dataset")
+
+    data = list(dataset)
+    if time_column:
+        try:
+            data.sort(key=lambda x: x.get(time_column))
+        except Exception as exc:
+            raise InvalidExpressionException(str(exc)) from exc
+
+    return split_dataset(
+        data,
+        train_fraction=train_fraction,
+        validation_fraction=validation_fraction,
+        test_fraction=test_fraction,
+        shuffle=False,
+    )
+
+
+def group_split(
+    dataset: List[Dict[str, Any]],
+    group_field: str,
+    train_fraction: float,
+    validation_fraction: float = 0.0,
+    test_fraction: float | None = None,
+    shuffle_groups: bool = True,
+    random_seed: int | None = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Split dataset by assigning entire groups to each set (feature #B7D12-F0005)."""
+
+    if group_field not in dataset[0]:
+        raise MissingParameterException(
+            "group_field is required and must exist in dataset")
+
+    groups: Dict[Any, List[Dict[str, Any]]] = {}
+    for row in dataset:
+        key = row.get(group_field)
+        groups.setdefault(key, []).append(row)
+
+    group_items = list(groups.items())
+    if shuffle_groups:
+        rnd = random.Random(random_seed)
+        rnd.shuffle(group_items)
+
+    total = len(dataset)
+    train_target = int(total * train_fraction)
+    val_target = int(total * validation_fraction)
+
+    train_set: List[Dict[str, Any]] = []
+    val_set: List[Dict[str, Any]] = []
+    test_set: List[Dict[str, Any]] = []
+    counts = {"train": 0, "validation": 0}
+
+    for _, rows in group_items:
+        if counts["train"] < train_target:
+            train_set.extend(rows)
+            counts["train"] += len(rows)
+        elif validation_fraction > 0 and counts["validation"] < val_target:
+            val_set.extend(rows)
+            counts["validation"] += len(rows)
+        else:
+            test_set.extend(rows)
+
+    result = {"train": train_set, "test": test_set}
+    if validation_fraction > 0:
+        result["validation"] = val_set
+    return result
 
 
 # Main class ----------------------------------------------------------------
